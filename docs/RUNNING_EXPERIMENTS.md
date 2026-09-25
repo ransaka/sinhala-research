@@ -2,6 +2,20 @@
 
 Run these commands from a clone of this repository. They use real SLR52 FLAC files and one trainer for code points, SentencePiece unigram, and `sinlib` phonological units. The only arm-specific training argument is `--target` (plus `--sp-vocab-size` for SentencePiece).
 
+## One-command download and run
+
+After installing `uv` and `hf` as below, use `hf auth login` only if your dataset access requires it. From the repo root, run a two-GPU staged code-point experiment using the frozen split:
+
+```bash
+bash scripts/run_slr52.sh --split /absolute/path/to/approved_speaker_split.csv \
+  --gpus 2 --target codepoint --steps 2048 \
+  --output outputs/slr52-codepoint-stage-2gpu
+```
+
+For an exploratory run without your frozen split, replace `--split ...` with `--exploratory-split`. The script downloads revision `bd1d968241e7edf8ce1577f569f59aac5c0f6b37` of `Ransaka/SinhalaASR`, verifies the archive SHA-256, extracts `train/` and `test/`, downloads pinned XLS-R, prepares the private manifest, and launches `torchrun` for `--gpus 2`. The archive is about 12.9 GB compressed; extracted audio and checkpoints need additional space. Use `--audio-root /absolute/path` to reuse an existing extracted corpus and skip the archive download. Run `bash scripts/run_slr52.sh --help` for all arguments.
+
+To run SentencePiece or `sinlib`, change `--target` and `--output`. To resume, repeat the original arguments with `--resume latest` and a larger `--steps` total. Use `--train-limit 0 --dev-limit 0` for full partitions, with a profiled and frozen step budget. For two GPUs, `--batch-size 2` means **2 utterances per GPU and 4 globally per optimizer update**. On 2,048 train rows, 2,048 two-GPU updates are four passes, matching the audio exposure of 4,096 one-GPU updates at batch size 2. An incomplete last global batch repeats up to three rows from the deterministic shuffled order so every source row is seen. Keep GPU count, batch size, and encoder directory fixed when resuming. The trainer supports `--regularization none` in distributed mode.
+
 ## 1. Environment and inputs
 
 If needed, install `uv` and the Hugging Face `hf` CLI, then reopen the shell so both commands are on `PATH`:
@@ -30,8 +44,8 @@ The extracted corpus root must contain `train/<utterance_id>.flac` and `test/<ut
 ```bash
 export SLR_AUDIO_ROOT=/absolute/path/to/extracted/asrsinhala
 export SLR_SPLIT_CSV=/absolute/path/to/approved_speaker_split.csv
-export SLR_TRAIN_CSV=data/source_metadata/train_metadata.csv
-export SLR_TEST_CSV=data/source_metadata/test_metadata.csv
+export SLR_TRAIN_CSV=data/source_metadata/data/train_metadata.csv
+export SLR_TEST_CSV=data/source_metadata/data/test_metadata.csv
 ```
 
 If there is no approved split for an **exploratory** run, generate a deterministic speaker-grouped metadata split and set `SLR_SPLIT_CSV=data/manifests/slr52_v1/speaker_grouped_manifest.csv`. This generated split is row-balanced only, not an audited final benchmark split.

@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import argparse
 import csv
+from datetime import timedelta
 import hashlib
 import importlib.metadata as package_metadata
 import json
+import os
 import random
 import shutil
 import time
@@ -21,6 +23,8 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel
 from jiwer import cer, wer
 from transformers import Wav2Vec2FeatureExtractor, Wav2Vec2ForCTC
 
@@ -128,7 +132,23 @@ def write_json(path: Path, value) -> None:
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
-def save_checkpoint(model, optimizer, output: Path, step: int, state: dict, keep: int) -> None:
+def save_checkpoint(model, optimizer, output: Path, step: int, state: dict, keep: int,
+                    rank: int, world_size: int, device: torch.device) -> None:
+    rank_rng = {
+        "python_rng": random.getstate(),
+        "numpy_rng": np.random.get_state(),
+        "torch_rng": torch.get_rng_state(),
+        "cuda_rng": torch.cuda.get_rng_state(device) if device.type == "cuda" else None,
+        "mps_rng": torch.mps.get_rng_state() if device.type == "mps" else None,
+    }
+    all_rng = [None] * world_size if rank == 0 else None
+    if world_size > 1:
+        dist.gather_object(rank_rng, all_rng, dst=0)
+    else:
+        all_rng = [rank_rng]
+    if rank != 0:
+        dist.barrier()
+        return
     folder = output / "checkpoints" / f"step-{step:08d}"
     temporary = output / "checkpoints" / f".step-{step:08d}.tmp"
     if temporary.exists():
@@ -138,10 +158,7 @@ def save_checkpoint(model, optimizer, output: Path, step: int, state: dict, keep
     torch.save({
         "optimizer": optimizer.state_dict(),
         "state": state,
-        "python_rng": random.getstate(),
-        "numpy_rng": np.random.get_state(),
-        "torch_rng": torch.get_rng_state(),
-        "mps_rng": torch.mps.get_rng_state() if torch.backends.mps.is_available() else None,
+        "rank_rng": all_rng,
     }, temporary / "trainer_state.pt")
     if folder.exists():
         shutil.rmtree(folder)
@@ -150,6 +167,8 @@ def save_checkpoint(model, optimizer, output: Path, step: int, state: dict, keep
     old = sorted((output / "checkpoints").glob("step-*"))
     for path in old[:-keep]:
         shutil.rmtree(path)
+    if world_size > 1:
+        dist.barrier()
 
 
 def main() -> None:
@@ -187,6 +206,20 @@ def main() -> None:
         raise ValueError("Bucket size must be nonnegative")
     if args.sp_vocab_size < 32:
         raise ValueError("SentencePiece vocabulary size must be at least 32")
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if world_size > 1:
+        if not torch.cuda.is_available():
+            raise ValueError("Distributed training requires CUDA GPUs and torchrun")
+        if args.regularization != "none":
+            raise ValueError("Distributed training currently requires --regularization none")
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend="nccl", init_method="env://", timeout=timedelta(hours=12))
+    device = torch.device(f"cuda:{local_rank}" if world_size > 1 else
+                          "cuda" if torch.cuda.is_available() else
+                          "mps" if torch.backends.mps.is_available() else "cpu")
+    global_batch_size = args.batch_size * world_size
 
     manifest_hash = file_hash(args.manifest)
     train_all, dev_all, counts = read_manifest(args.manifest)
@@ -196,20 +229,26 @@ def main() -> None:
     if args.resume:
         if not args.output.is_dir():
             raise ValueError("Resume output directory does not exist")
-        targets, target_meta = load_targets(args.output)
-        if targets.kind != args.target:
-            raise ValueError("Resume target type differs from the saved run")
     else:
-        if args.output.exists() and any(args.output.iterdir()):
-            raise ValueError(f"Output directory is not empty: {args.output}")
-        args.output.mkdir(parents=True, exist_ok=True)
-        (args.output / "checkpoints").mkdir(exist_ok=True)
-        targets, target_meta = build_targets(args.target, train, args.output, args.sp_vocab_size)
+        if rank == 0:
+            if args.output.exists() and any(args.output.iterdir()):
+                raise ValueError(f"Output directory is not empty: {args.output}")
+            args.output.mkdir(parents=True, exist_ok=True)
+            (args.output / "checkpoints").mkdir(exist_ok=True)
+            build_targets(args.target, train, args.output, args.sp_vocab_size)
+        if world_size > 1:
+            dist.barrier()
+    targets, target_meta = load_targets(args.output)
+    if targets.kind != args.target:
+        raise ValueError("Resume target type differs from the saved run")
     target_audit = {"train": targets.audit(train, "train", strict=True),
                     "dev": targets.audit(dev, "dev")}
     signature = {
         "manifest_sha256": manifest_hash, "target_metadata": target_meta,
+        "encoder_path": str(args.encoder.resolve()),
+        "feature_extractor_sha256": file_hash(args.encoder / "preprocessor_config.json"),
         "target_type": args.target, "sp_vocab_size": args.sp_vocab_size,
+        "world_size": world_size, "global_batch_size": global_batch_size,
         "train_limit": args.train_limit, "dev_limit": args.dev_limit,
         "train_eval_examples": args.train_eval_examples, "batch_size": args.batch_size,
         "bucket_size": args.bucket_size,
@@ -228,9 +267,11 @@ def main() -> None:
         if args.resume.resolve() != Path(latest["path"]).resolve():
             raise ValueError("Resume from the latest checkpoint to preserve metric and best-model history")
 
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
+    random.seed(args.seed + rank)
+    np.random.seed(args.seed + rank)
+    torch.manual_seed(args.seed + rank)
+    if device.type == "cuda":
+        torch.cuda.manual_seed(args.seed + rank)
     extractor = Wav2Vec2FeatureExtractor.from_pretrained(args.encoder)
     overrides = {"apply_spec_augment": False, "mask_time_prob": 0.0,
                  "hidden_dropout": 0.0, "attention_dropout": 0.0,
@@ -243,8 +284,7 @@ def main() -> None:
         **overrides,
     )
     model.freeze_feature_encoder()
-    model.gradient_checkpointing_enable()
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     model.to(device)
     encoder_parameters = [p for name, p in model.named_parameters()
                           if p.requires_grad and not name.startswith("lm_head.")]
@@ -252,6 +292,9 @@ def main() -> None:
         {"params": encoder_parameters, "lr": args.encoder_lr},
         {"params": list(model.lm_head.parameters()), "lr": args.head_lr},
     ], weight_decay=0.01)
+    raw_model = model
+    if world_size > 1:
+        model = DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank)
 
     run_config = {
         "dataset": "SLR52 extracted FLAC with explicit speaker split",
@@ -265,6 +308,10 @@ def main() -> None:
         "train_hours_from_headers": sum(row["seconds"] for row in train) / 3600,
         "dev_hours_from_headers": sum(row["seconds"] for row in dev) / 3600,
         "vocab_size": len(targets.vocab), "device": str(device),
+        "world_size": world_size, "per_gpu_batch_size": args.batch_size,
+        "global_batch_size": global_batch_size,
+        "incomplete_global_batch_policy": "pad from shuffled order" if world_size > 1 else "keep",
+        "repeated_rows_per_epoch": ((-len(train)) % global_batch_size) if world_size > 1 else 0,
         "initial_max_steps": args.max_steps,
         "model_parameters": sum(p.numel() for p in model.parameters()),
         "test_partition_opened": False,
@@ -273,7 +320,7 @@ def main() -> None:
         "soundfile_version": package_metadata.version("soundfile"),
         "jiwer_version": package_metadata.version("jiwer"),
     }
-    if not args.resume:
+    if not args.resume and rank == 0:
         write_json(args.output / "run_config.json", run_config)
         write_json(args.output / "selected_ids.json", {
             "train": [row["id"] for row in train], "dev": [row["id"] for row in dev],
@@ -285,11 +332,14 @@ def main() -> None:
         saved = torch.load(args.resume / "trainer_state.pt", map_location="cpu", weights_only=False)
         optimizer.load_state_dict(saved["optimizer"])
         state = saved["state"]
-        random.setstate(saved["python_rng"])
-        np.random.set_state(saved["numpy_rng"])
-        torch.set_rng_state(saved["torch_rng"])
-        if device.type == "mps" and saved["mps_rng"] is not None:
-            torch.mps.set_rng_state(saved["mps_rng"])
+        rng = saved["rank_rng"][rank]
+        random.setstate(rng["python_rng"])
+        np.random.set_state(rng["numpy_rng"])
+        torch.set_rng_state(rng["torch_rng"])
+        if device.type == "cuda":
+            torch.cuda.set_rng_state(rng["cuda_rng"], device)
+        if device.type == "mps":
+            torch.mps.set_rng_state(rng["mps_rng"])
         if args.max_steps <= state["step"]:
             raise ValueError("--max-steps must exceed the checkpoint's completed step")
         metrics_file = args.output / "metrics.jsonl"
@@ -298,35 +348,41 @@ def main() -> None:
             if lines and json.loads(lines[-1])["step"] > state["step"]:
                 raise ValueError("Metrics extend past the latest checkpoint; use a new output directory")
 
-    with (args.output / "run_events.jsonl").open("a", encoding="utf-8") as stream:
-        stream.write(json.dumps({"event": "resume" if args.resume else "start",
-                                 "checkpoint": str(args.resume) if args.resume else None,
-                                 "target_max_steps": args.max_steps,
-                                 "unix_time": time.time()}, ensure_ascii=False) + "\n")
+    if rank == 0:
+        with (args.output / "run_events.jsonl").open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps({"event": "resume" if args.resume else "start",
+                                     "checkpoint": str(args.resume) if args.resume else None,
+                                     "target_max_steps": args.max_steps,
+                                     "unix_time": time.time()}, ensure_ascii=False) + "\n")
 
     start = time.perf_counter()
     metrics_path = args.output / "metrics.jsonl"
 
     def run_evaluation() -> None:
-        train_metrics, train_predictions = evaluate(model, train_eval, extractor, targets, device, args.batch_size)
-        dev_metrics, dev_predictions = evaluate(model, dev, extractor, targets, device, args.batch_size)
-        record = {"step": state["step"], "epoch": state["epoch"] + 1,
-                  "train": train_metrics, "dev": dev_metrics,
-                  "elapsed_seconds_this_process": time.perf_counter() - start,
-                  "processed_audio_seconds_total": state["processed_audio_seconds"]}
-        with metrics_path.open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps(record, ensure_ascii=False) + "\n")
-        prediction_path = args.output / "eval_predictions" / f"step-{state['step']:08d}.jsonl"
-        prediction_path.parent.mkdir(exist_ok=True)
-        with prediction_path.open("w", encoding="utf-8") as stream:
-            for partition, predictions in (("train", train_predictions), ("dev", dev_predictions)):
-                for item in predictions:
-                    stream.write(json.dumps({"partition": partition, **item}, ensure_ascii=False) + "\n")
-        if dev_metrics["cer"] < state["best_dev_cer"]:
-            state["best_dev_cer"] = dev_metrics["cer"]
-            model.save_pretrained(args.output / "best_dev_model")
-            write_json(args.output / "best_dev_metrics.json", record)
-        print(json.dumps(record, ensure_ascii=False), flush=True)
+        if rank == 0:
+            train_metrics, train_predictions = evaluate(raw_model, train_eval, extractor, targets, device, args.batch_size)
+            dev_metrics, dev_predictions = evaluate(raw_model, dev, extractor, targets, device, args.batch_size)
+            record = {"step": state["step"], "epoch": state["epoch"] + 1,
+                      "train": train_metrics, "dev": dev_metrics,
+                      "elapsed_seconds_this_process": time.perf_counter() - start,
+                      "processed_audio_seconds_total": state["processed_audio_seconds"]}
+            with metrics_path.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+            prediction_path = args.output / "eval_predictions" / f"step-{state['step']:08d}.jsonl"
+            prediction_path.parent.mkdir(exist_ok=True)
+            with prediction_path.open("w", encoding="utf-8") as stream:
+                for partition, predictions in (("train", train_predictions), ("dev", dev_predictions)):
+                    for item in predictions:
+                        stream.write(json.dumps({"partition": partition, **item}, ensure_ascii=False) + "\n")
+            if dev_metrics["cer"] < state["best_dev_cer"]:
+                state["best_dev_cer"] = dev_metrics["cer"]
+                raw_model.save_pretrained(args.output / "best_dev_model")
+                write_json(args.output / "best_dev_metrics.json", record)
+            print(json.dumps(record, ensure_ascii=False), flush=True)
+        if world_size > 1:
+            best = [state["best_dev_cer"] if rank == 0 else None]
+            dist.broadcast_object_list(best, src=0)
+            state["best_dev_cer"] = best[0]
 
     while state["step"] < args.max_steps:
         order = list(range(len(train)))
@@ -336,11 +392,16 @@ def main() -> None:
                 order[offset : offset + args.bucket_size] = sorted(
                     order[offset : offset + args.bucket_size], key=lambda index: train[index]["seconds"]
                 )
-        for batch_index in range(state["batch_offset"], (len(order) + args.batch_size - 1) // args.batch_size):
-            indices = order[batch_index * args.batch_size : (batch_index + 1) * args.batch_size]
+        epoch_batches = (len(order) + global_batch_size - 1) // global_batch_size
+        for batch_index in range(state["batch_offset"], epoch_batches):
+            global_indices = order[batch_index * global_batch_size : (batch_index + 1) * global_batch_size]
+            if world_size > 1 and len(global_indices) < global_batch_size:
+                missing = global_batch_size - len(global_indices)
+                global_indices += [order[(state["epoch"] + i) % len(order)] for i in range(missing)]
+            indices = global_indices[rank * args.batch_size : (rank + 1) * args.batch_size]
             batch = [load_audio(train[i]) for i in indices]
             inputs, mask, labels = padded_batch(batch, extractor, targets, device)
-            output_lengths = model._get_feat_extract_output_lengths(mask.sum(-1)).cpu().tolist()
+            output_lengths = raw_model._get_feat_extract_output_lengths(mask.sum(-1)).cpu().tolist()
             for row, available in zip(batch, output_lengths):
                 target_ids = targets.encode(row["text"])
                 needed = len(target_ids) + sum(a == b for a, b in zip(target_ids, target_ids[1:]))
@@ -356,27 +417,36 @@ def main() -> None:
             optimizer.step()
             state["step"] += 1
             state["batch_offset"] = batch_index + 1
-            state["processed_audio_seconds"] += sum(row["seconds"] for row in batch)
+            state["processed_audio_seconds"] += sum(train[i]["seconds"] for i in global_indices)
             if state["step"] % args.log_every == 0:
-                print(json.dumps({"step": state["step"], "epoch": state["epoch"] + 1,
-                                  "loss": float(loss.detach().cpu()),
-                                  "elapsed_seconds_this_process": time.perf_counter() - start},
-                                 ensure_ascii=False), flush=True)
+                log_loss = loss.detach().clone()
+                if world_size > 1:
+                    dist.all_reduce(log_loss, op=dist.ReduceOp.SUM)
+                    log_loss /= world_size
+                if rank == 0:
+                    print(json.dumps({"step": state["step"], "epoch": state["epoch"] + 1,
+                                      "loss": float(log_loss.cpu()),
+                                      "elapsed_seconds_this_process": time.perf_counter() - start},
+                                     ensure_ascii=False), flush=True)
             if state["step"] % args.eval_every == 0 or state["step"] == args.max_steps:
                 run_evaluation()
             if (state["step"] % args.checkpoint_every == 0
                     or state["step"] % args.eval_every == 0
                     or state["step"] == args.max_steps):
-                save_checkpoint(model, optimizer, args.output, state["step"], state, args.keep_checkpoints)
+                save_checkpoint(raw_model, optimizer, args.output, state["step"], state,
+                                args.keep_checkpoints, rank, world_size, device)
             if state["step"] >= args.max_steps:
                 break
-        if state["batch_offset"] >= (len(order) + args.batch_size - 1) // args.batch_size:
+        if state["batch_offset"] >= epoch_batches:
             state["epoch"] += 1
             state["batch_offset"] = 0
-    print(json.dumps({"completed": True, "step": state["step"],
-                      "best_dev_cer": state["best_dev_cer"],
-                      "wall_seconds_this_process": time.perf_counter() - start},
-                     ensure_ascii=False), flush=True)
+    if rank == 0:
+        print(json.dumps({"completed": True, "step": state["step"],
+                          "best_dev_cer": state["best_dev_cer"],
+                          "wall_seconds_this_process": time.perf_counter() - start},
+                         ensure_ascii=False), flush=True)
+    if world_size > 1:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
