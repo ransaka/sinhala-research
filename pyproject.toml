@@ -1,0 +1,20 @@
+[project]
+name = "sinhala-asr-research"
+version = "0.1.0"
+requires-python = ">=3.12, <3.13"
+dependencies = [
+    "accelerate>=1.15.0",
+    "datasets>=5.0.1",
+    "evaluate>=0.4.6",
+    "jiwer>=4.0.0",
+    "matplotlib>=3.11.2",
+    "pillow>=11.0.0",
+    "safetensors>=0.8.0",
+    "sentencepiece>=0.2.2",
+    "sinlib>=0.3.2",
+    "soundfile>=0.14.0",
+    "tensorboard>=2.21.0",
+    "torch>=2.14.0",
+    "torchaudio>=2.11.0",
+    "transformers>=5.17.0",
+]

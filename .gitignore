@@ -1,0 +1,34 @@
+# Research corpora and derived dataset shards/manifests may be restricted.
+data/
+datasets/
+audio/
+*.wav
+*.flac
+*.mp3
+*.parquet
+*.tar.gz
+*.csv
+*.tsv
+*.jsonl
+
+# Model weights, checkpoints, optimizer state, and local experiment outputs.
+checkpoints/
+outputs/
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+
+# Local environment and machine clutter.
+.venv/
+venv/
+__pycache__/
+.DS_Store
+
+# Keep the repository focused on project code and phase status updates.
+*.md
+!phase/PHASE*_STATUS.md
+references/
+.codex/
+progress/
+progress_latest/
