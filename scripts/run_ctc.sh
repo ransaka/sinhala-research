@@ -11,6 +11,7 @@ HF_REPO=IAmNotAnanth/sinhala-ctc-111h
 HF_REVISION=a59ffd444b39ff3c9fca387f2d4879201511f93b
 INPUT_MANIFEST=""
 BUCKET_ROOT=""
+PARQUET_DIRECT=0
 AUDIO_ROOT=""
 SPLIT_CSV=""
 EXPLORATORY=0
@@ -23,6 +24,8 @@ DEV_LIMIT=512
 BATCH_SIZE=2
 EVAL_EVERY=512
 CHECKPOINT_EVERY=1024
+KEEP_CHECKPOINTS=1
+SAVE_BEST_MODEL=0
 SEED=13
 OUTPUT=""
 RESUME=""
@@ -40,6 +43,7 @@ Options:
   --hf-repo ID              Hub dataset with audio/text/duration columns
   --hf-revision COMMIT      Immutable Hub revision for --dataset hf-audio
   --bucket-root PATH        Mounted/downloaded bucket with data/*.parquet
+  --parquet-direct          Read audio from mounted Parquet; no local audio copy
   --manifest PATH           Existing common CSV for --dataset manifest
   --split PATH              Speaker split CSV for --dataset slr52
   --exploratory-split        Generate a provisional SLR52 speaker split
@@ -52,6 +56,8 @@ Options:
   --batch-size N            Per-GPU batch size (default 2)
   --eval-every N            Update interval (default 512)
   --checkpoint-every N      Update interval (default 1024)
+  --keep-checkpoints N      Rolling checkpoints to retain (default 1)
+  --save-best-model         Also retain dev-best model weights
   --seed N                  Seed (default 13)
   --data-dir PATH           Dataset cache/materialization directory
   --audio-root PATH         Existing extracted SLR52 root; skip archive download
@@ -66,7 +72,7 @@ EOF
 
 while (($#)); do
   case "$1" in
-    --dataset|--hf-repo|--hf-revision|--bucket-root|--manifest|--split|--target|--sp-vocab-size|--gpus|--steps|--train-limit|--dev-limit|--batch-size|--eval-every|--checkpoint-every|--seed|--data-dir|--audio-root|--encoder-dir|--output|--resume)
+    --dataset|--hf-repo|--hf-revision|--bucket-root|--manifest|--split|--target|--sp-vocab-size|--gpus|--steps|--train-limit|--dev-limit|--batch-size|--eval-every|--checkpoint-every|--keep-checkpoints|--seed|--data-dir|--audio-root|--encoder-dir|--output|--resume)
       (($# >= 2)) || { echo "Missing value for $1" >&2; exit 2; }
       case "$1" in
         --dataset) DATASET="$2";;
@@ -84,6 +90,7 @@ while (($#)); do
         --batch-size) BATCH_SIZE="$2";;
         --eval-every) EVAL_EVERY="$2";;
         --checkpoint-every) CHECKPOINT_EVERY="$2";;
+        --keep-checkpoints) KEEP_CHECKPOINTS="$2";;
         --seed) SEED="$2";;
         --data-dir) DATA_DIR="$2";;
         --audio-root) AUDIO_ROOT="$2";;
@@ -93,6 +100,8 @@ while (($#)); do
       esac
       shift 2;;
     --exploratory-split) EXPLORATORY=1; shift;;
+    --parquet-direct) PARQUET_DIRECT=1; shift;;
+    --save-best-model) SAVE_BEST_MODEL=1; shift;;
     --help|-h) usage; exit 0;;
     *) echo "Unknown argument: $1" >&2; usage >&2; exit 2;;
   esac
@@ -101,7 +110,7 @@ done
 [[ "$DATASET" == hf-audio || "$DATASET" == slr52 || "$DATASET" == manifest ]] || { echo "Invalid dataset" >&2; exit 2; }
 [[ "$TARGET" == codepoint || "$TARGET" == sentencepiece || "$TARGET" == sinlib ]] || { echo "Invalid target" >&2; exit 2; }
 [[ "$GPUS" =~ ^[1-9][0-9]*$ ]] || { echo "--gpus must be a positive integer" >&2; exit 2; }
-for value in "$STEPS" "$BATCH_SIZE" "$EVAL_EVERY" "$CHECKPOINT_EVERY" "$SP_VOCAB_SIZE"; do
+for value in "$STEPS" "$BATCH_SIZE" "$EVAL_EVERY" "$CHECKPOINT_EVERY" "$SP_VOCAB_SIZE" "$KEEP_CHECKPOINTS"; do
   [[ "$value" =~ ^[1-9][0-9]*$ ]] || { echo "Steps, batch size and intervals must be positive integers" >&2; exit 2; }
 done
 for value in "$TRAIN_LIMIT" "$DEV_LIMIT" "$SEED"; do
@@ -122,6 +131,9 @@ if [[ "$DATASET" == manifest && -z "$INPUT_MANIFEST" ]]; then
 fi
 if [[ -n "$BUCKET_ROOT" && "$DATASET" != hf-audio ]]; then
   echo "--bucket-root applies only to --dataset hf-audio" >&2; exit 2
+fi
+if [[ "$PARQUET_DIRECT" -eq 1 && -z "$BUCKET_ROOT" ]]; then
+  echo "--parquet-direct requires --bucket-root" >&2; exit 2
 fi
 command -v uv >/dev/null || { echo "uv is required; see docs/RUNNING_EXPERIMENTS.md" >&2; exit 2; }
 
@@ -158,9 +170,13 @@ if [[ ! -f "$ENCODER_DIR/config.json" || ! -f "$ENCODER_DIR/preprocessor_config.
 fi
 
 if [[ "$DATASET" == hf-audio ]]; then
-  MANIFEST="$DATA_DIR/training.csv"
+  STORAGE_MODE=flac
+  if [[ "$PARQUET_DIRECT" -eq 1 ]]; then STORAGE_MODE=parquet; fi
+  MANIFEST="$DATA_DIR/training_${STORAGE_MODE}_train${TRAIN_LIMIT}_dev${DEV_LIMIT}.csv"
   PREP_ARGS=(--repo-id "$HF_REPO" --revision "$HF_REVISION"
-    --output "$MANIFEST" --audio-dir "$DATA_DIR/audio" --seed "$SEED")
+    --output "$MANIFEST" --audio-dir "$DATA_DIR/audio" --seed "$SEED"
+    --train-limit "$TRAIN_LIMIT" --dev-limit "$DEV_LIMIT"
+    --audio-storage "$STORAGE_MODE")
   if [[ -n "$BUCKET_ROOT" ]]; then PREP_ARGS+=(--parquet-root "$BUCKET_ROOT"); fi
   .venv/bin/python tools/prepare_hf_audio_manifest.py "${PREP_ARGS[@]}"
   DATASET_ID="hf:$HF_REPO@$HF_REVISION"
@@ -241,7 +257,9 @@ TRAIN_ARGS=(--manifest "$MANIFEST" --dataset-id "$DATASET_ID"
   --sp-vocab-size "$SP_VOCAB_SIZE"
   --output "$OUTPUT" --train-limit "$TRAIN_LIMIT" --dev-limit "$DEV_LIMIT"
   --batch-size "$BATCH_SIZE" --max-steps "$STEPS" --eval-every "$EVAL_EVERY"
-  --checkpoint-every "$CHECKPOINT_EVERY" --regularization none --seed "$SEED")
+  --checkpoint-every "$CHECKPOINT_EVERY" --keep-checkpoints "$KEEP_CHECKPOINTS"
+  --regularization none --seed "$SEED")
+if [[ "$SAVE_BEST_MODEL" -eq 0 ]]; then TRAIN_ARGS+=(--no-best-model); fi
 if [[ -n "$RESUME" ]]; then TRAIN_ARGS+=(--resume "$RESUME"); fi
 
 if ((GPUS > 1)); then

@@ -10,8 +10,10 @@ from __future__ import annotations
 import argparse
 import csv
 from datetime import timedelta
+from functools import lru_cache
 import hashlib
 import importlib.metadata as package_metadata
+import io
 import json
 import os
 import random
@@ -24,6 +26,7 @@ import soundfile as sf
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
+import pyarrow.parquet as pq
 from jiwer import cer, wer
 from transformers import Wav2Vec2FeatureExtractor, Wav2Vec2ForCTC
 
@@ -70,8 +73,10 @@ def read_manifest(path: Path) -> tuple[list[dict], list[dict], dict, dict]:
                 continue  # Test text and audio are never read.
             text = normalize(row["transcript"])
             duration = float(row["duration_seconds"])
-            audio_path = Path(row["audio_path"])
-            if not text or duration <= 0 or not audio_path.is_file():
+            audio_path = row["audio_path"]
+            source_path = (Path(json.loads(audio_path[len("parquet:"):])["path"])
+                           if audio_path.startswith("parquet:") else Path(audio_path))
+            if not text or duration <= 0 or not source_path.is_file():
                 raise ValueError(f"Invalid train/dev row or missing audio: {item_id}")
             item = {"id": item_id, "speaker_id": speaker, "text": text,
                     "audio_path": audio_path, "seconds": duration}
@@ -93,8 +98,27 @@ def choose_rows(rows: list[dict], limit: int, seed: int) -> list[dict]:
     return ordered[:limit]
 
 
+@lru_cache(maxsize=8)
+def parquet_file(path: str):
+    return pq.ParquetFile(path)
+
+
+@lru_cache(maxsize=2)
+def parquet_audio_group(path: str, group: int):
+    return parquet_file(path).read_row_group(group, columns=["audio"]).column(0)
+
+
 def load_audio(row: dict) -> dict:
-    waveform, rate = sf.read(row["audio_path"], dtype="float32")
+    location = row["audio_path"]
+    if location.startswith("parquet:"):
+        reference = json.loads(location[len("parquet:"):])
+        cell = parquet_audio_group(reference["path"], reference["row_group"])[reference["row"]].as_py()
+        payload = cell.get("bytes") if isinstance(cell, dict) else None
+        if not payload:
+            raise ValueError(f"Parquet audio bytes missing for {row['id']}")
+        waveform, rate = sf.read(io.BytesIO(payload), dtype="float32")
+    else:
+        waveform, rate = sf.read(location, dtype="float32")
     if waveform.ndim == 2:
         waveform = waveform.mean(axis=1)
     if rate != SAMPLE_RATE or len(waveform) == 0:
@@ -197,6 +221,8 @@ def main() -> None:
     parser.add_argument("--eval-every", type=int, default=500)
     parser.add_argument("--checkpoint-every", type=int, default=1000)
     parser.add_argument("--keep-checkpoints", type=int, default=2)
+    parser.add_argument("--no-best-model", action="store_true",
+                        help="Record best dev metric without storing an extra model copy")
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--encoder-lr", type=float, default=1e-5)
     parser.add_argument("--head-lr", type=float, default=3e-4)
@@ -264,6 +290,7 @@ def main() -> None:
         "encoder_lr": args.encoder_lr, "head_lr": args.head_lr,
         "eval_every": args.eval_every, "checkpoint_every": args.checkpoint_every,
         "keep_checkpoints": args.keep_checkpoints, "log_every": args.log_every,
+        "no_best_model": args.no_best_model,
     }
     if args.resume:
         old = json.loads((args.output / "run_config.json").read_text())
@@ -307,6 +334,7 @@ def main() -> None:
     run_config = {
         "dataset": args.dataset_id,
         "speaker_status": speaker_status,
+        "audio_storage": "mounted_parquet" if train[0]["audio_path"].startswith("parquet:") else "files",
         "signature": signature, "source_manifest": str(args.manifest.resolve()),
         "encoder": str(args.encoder.resolve()), "encoder_revision": MODEL_REVISION,
         "target_units": args.target,
@@ -385,7 +413,8 @@ def main() -> None:
                         stream.write(json.dumps({"partition": partition, **item}, ensure_ascii=False) + "\n")
             if dev_metrics["cer"] < state["best_dev_cer"]:
                 state["best_dev_cer"] = dev_metrics["cer"]
-                raw_model.save_pretrained(args.output / "best_dev_model")
+                if not args.no_best_model:
+                    raw_model.save_pretrained(args.output / "best_dev_model")
                 write_json(args.output / "best_dev_metrics.json", record)
             print(json.dumps(record, ensure_ascii=False), flush=True)
         if world_size > 1:
@@ -439,9 +468,7 @@ def main() -> None:
                                      ensure_ascii=False), flush=True)
             if state["step"] % args.eval_every == 0 or state["step"] == args.max_steps:
                 run_evaluation()
-            if (state["step"] % args.checkpoint_every == 0
-                    or state["step"] % args.eval_every == 0
-                    or state["step"] == args.max_steps):
+            if state["step"] % args.checkpoint_every == 0 or state["step"] == args.max_steps:
                 save_checkpoint(raw_model, optimizer, args.output, state["step"], state,
                                 args.keep_checkpoints, rank, world_size, device)
             if state["step"] >= args.max_steps:
