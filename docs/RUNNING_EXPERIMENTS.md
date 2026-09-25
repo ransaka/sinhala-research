@@ -1,20 +1,53 @@
-# Run the SLR52 CTC experiments
+# Run the Sinhala CTC experiments
 
-Run these commands from a clone of this repository. They use real SLR52 FLAC files and one trainer for code points, SentencePiece unigram, and `sinlib` phonological units. The only arm-specific training argument is `--target` (plus `--sp-vocab-size` for SentencePiece).
+Run these commands from a clone of this repository. The default dataset is pinned `IAmNotAnanth/sinhala-ctc-111h`; SLR52 and a prepared common CSV manifest remain available. One trainer handles code points, SentencePiece unigram, and `sinlib` phonological units. The only arm-specific training argument is `--target` (plus `--sp-vocab-size` for SentencePiece).
 
-## One-command download and run
+## Default: 111-hour dataset on two GPUs
 
-After installing `uv` and `hf` as below, use `hf auth login` only if your dataset access requires it. From the repo root, run a two-GPU staged code-point experiment using the frozen split:
+Install `uv` and `hf` if absent, accept the dataset's access conditions on its [Hub page](https://huggingface.co/datasets/IAmNotAnanth/sinhala-ctc-111h), then authenticate with `hf auth login` if the Hub requests it. From the repo root:
 
 ```bash
-bash scripts/run_slr52.sh --split /absolute/path/to/approved_speaker_split.csv \
+bash scripts/run_ctc.sh --dataset hf-audio \
+  --gpus 2 --target codepoint --steps 2048 \
+  --output outputs/iam111h-codepoint-stage-2gpu
+```
+
+The script streams revision `a59ffd444b39ff3c9fca387f2d4879201511f93b` of the dataset, materializes its embedded WAV audio under ignored `data/`, checks audio headers and reported durations, freezes an 80/10/10 exact-audio/text-grouped internal split, downloads pinned XLS-R if needed, and launches `torchrun`. A completed manifest is reused on later runs. Preparation reads about 12.7 GB of Parquet data and writes materialized audio, so provide sufficient persistent storage for audio, caches, and checkpoints.
+
+To use the bucket you mounted or downloaded, point to its root containing `data/train-00000-of-00026.parquet` through `data/train-00025-of-00026.parquet`:
+
+```bash
+bash scripts/run_ctc.sh --dataset hf-audio --bucket-root /absolute/path/to/local \
+  --gpus 2 --target codepoint --steps 2048 \
+  --output outputs/iam111h-bucket-codepoint-stage-2gpu
+```
+
+The bucket contains the same Parquet shards, not a prepared audio tree or training manifest. `--bucket-root` avoids Hub dataset streaming but still reads all shards and materializes audio. A local bucket path is checked for the exact 26 shard names and total size; its bytes are not independently hashed by the adapter, so the declared Hub revision is recorded as unverified for that input mode. On Kaggle, use this option only if the bucket is already accessible as a local folder; the macOS `brew` mount command is not a Kaggle setup command.
+
+To run SentencePiece or `sinlib`, change `--target` and `--output`. To resume, repeat the command with `--resume latest` and a larger `--steps` total. Use `--train-limit 0 --dev-limit 0` for full partitions once the training budget is frozen. GPU count, batch size, dataset revision, manifest, and encoder path must remain the same on resume.
+
+This dataset has no speaker IDs. Its internal split prevents exact waveform and identical normalized transcript overlap, but **speaker overlap is unknown**. It is suitable for training and controlled tokenizer development; it does not by itself show performance on unseen speakers. Those claims need a separate, lineage-checked evaluation set with speaker identity or an equivalent reliable grouping. The trainer does not perform speaker detection.
+
+## Optional SLR52 source
+
+Use the existing source adapter and a frozen speaker split:
+
+```bash
+bash scripts/run_ctc.sh --dataset slr52 \
+  --split /absolute/path/to/approved_speaker_split.csv \
   --gpus 2 --target codepoint --steps 2048 \
   --output outputs/slr52-codepoint-stage-2gpu
 ```
 
-For an exploratory run without your frozen split, replace `--split ...` with `--exploratory-split`. The script downloads revision `bd1d968241e7edf8ce1577f569f59aac5c0f6b37` of `Ransaka/SinhalaASR`, verifies the archive SHA-256, extracts `train/` and `test/`, downloads pinned XLS-R, prepares the private manifest, and launches `torchrun` for `--gpus 2`. The archive is about 12.9 GB compressed; extracted audio and checkpoints need additional space. Use `--audio-root /absolute/path` to reuse an existing extracted corpus and skip the archive download. Run `bash scripts/run_slr52.sh --help` for all arguments.
+For an exploratory SLR52 run without a frozen split, replace `--split ...` with `--exploratory-split`. This path downloads revision `bd1d968241e7edf8ce1577f569f59aac5c0f6b37` of `Ransaka/SinhalaASR`, verifies and extracts its archive, then prepares the train/dev manifest. The archive is about 12.9 GB compressed. Use `--audio-root /absolute/path` to reuse existing extracted audio. The legacy `scripts/run_slr52.sh` command remains as a wrapper for this source.
 
-To run SentencePiece or `sinlib`, change `--target` and `--output`. To resume, repeat the original arguments with `--resume latest` and a larger `--steps` total. Use `--train-limit 0 --dev-limit 0` for full partitions, with a profiled and frozen step budget. For two GPUs, `--batch-size 2` means **2 utterances per GPU and 4 globally per optimizer update**. On 2,048 train rows, 2,048 two-GPU updates are four passes, matching the audio exposure of 4,096 one-GPU updates at batch size 2. An incomplete last global batch repeats up to three rows from the deterministic shuffled order so every source row is seen. Keep GPU count, batch size, and encoder directory fixed when resuming. The trainer supports `--regularization none` in distributed mode.
+## Other audio/text/duration sources
+
+For another Hub dataset with the same three columns and one `train` split, specify `--hf-repo OWNER/NAME --hf-revision COMMIT` with `--dataset hf-audio` and a separate `--data-dir`. For an already prepared CSV, use `--dataset manifest --manifest /absolute/path/training.csv`. That CSV needs `utterance_id,partition,audio_path,transcript,duration_seconds`; `speaker_id` is optional. Train/dev audio must be readable by `soundfile` at 16 kHz. Test rows must have blank audio paths and transcripts. `bash scripts/run_ctc.sh --help` lists every option.
+
+## Manual SLR52 setup
+
+For two GPUs, `--batch-size 2` means **2 utterances per GPU and 4 globally per optimizer update**. On 2,048 train rows, 2,048 two-GPU updates are four passes, matching the audio exposure of 4,096 one-GPU updates at batch size 2. An incomplete last global batch repeats up to three rows from the deterministic shuffled order so every source row is seen. The trainer supports `--regularization none` in distributed mode.
 
 ## 1. Environment and inputs
 
@@ -73,22 +106,22 @@ This checks every train/dev audio header for 16 kHz and writes `data/manifests/s
 Run one command at a time. Each selects the same deterministic 2,048 train utterances, 512 dev utterances, 128 train evaluation utterances, seed, batch size, optimizer settings, and 4,096 updates. Each starts from the same XLS-R encoder; only output targets and head dimensions differ.
 
 ```bash
-.venv/bin/python tools/train_slr52_ctc.py \
-  --manifest data/manifests/slr52_training.csv --encoder checkpoints/xls-r-300m-1a640f3 \
+.venv/bin/python tools/train_ctc.py \
+  --dataset-id slr52 --manifest data/manifests/slr52_training.csv --encoder checkpoints/xls-r-300m-1a640f3 \
   --target codepoint --output outputs/slr52-stage-codepoint \
   --train-limit 2048 --dev-limit 512 --train-eval-examples 128 \
   --batch-size 2 --max-steps 4096 --eval-every 512 \
   --checkpoint-every 1024 --keep-checkpoints 2 --regularization none --seed 13
 
-.venv/bin/python tools/train_slr52_ctc.py \
-  --manifest data/manifests/slr52_training.csv --encoder checkpoints/xls-r-300m-1a640f3 \
+.venv/bin/python tools/train_ctc.py \
+  --dataset-id slr52 --manifest data/manifests/slr52_training.csv --encoder checkpoints/xls-r-300m-1a640f3 \
   --target sentencepiece --sp-vocab-size 512 --output outputs/slr52-stage-sentencepiece \
   --train-limit 2048 --dev-limit 512 --train-eval-examples 128 \
   --batch-size 2 --max-steps 4096 --eval-every 512 \
   --checkpoint-every 1024 --keep-checkpoints 2 --regularization none --seed 13
 
-.venv/bin/python tools/train_slr52_ctc.py \
-  --manifest data/manifests/slr52_training.csv --encoder checkpoints/xls-r-300m-1a640f3 \
+.venv/bin/python tools/train_ctc.py \
+  --dataset-id slr52 --manifest data/manifests/slr52_training.csv --encoder checkpoints/xls-r-300m-1a640f3 \
   --target sinlib --output outputs/slr52-stage-sinlib \
   --train-limit 2048 --dev-limit 512 --train-eval-examples 128 \
   --batch-size 2 --max-steps 4096 --eval-every 512 \
@@ -104,8 +137,8 @@ Inspect `metrics.jsonl` for train/dev WER, CER, empty hypotheses, blank-argmax f
 Read the run's `latest_checkpoint.json` and use its `path` value as `--resume`. All original arguments must match; `--max-steps` is the **new total** updates. Example when the latest checkpoint is step 4096:
 
 ```bash
-.venv/bin/python tools/train_slr52_ctc.py \
-  --manifest data/manifests/slr52_training.csv --encoder checkpoints/xls-r-300m-1a640f3 \
+.venv/bin/python tools/train_ctc.py \
+  --dataset-id slr52 --manifest data/manifests/slr52_training.csv --encoder checkpoints/xls-r-300m-1a640f3 \
   --target codepoint --output outputs/slr52-stage-codepoint \
   --resume outputs/slr52-stage-codepoint/checkpoints/step-00004096 \
   --train-limit 2048 --dev-limit 512 --train-eval-examples 128 \
@@ -123,7 +156,8 @@ After the staged profile, freeze one update budget, dev set, seed list, regulari
 FULL_STEPS=100000  # replace with the profiled, frozen budget before starting
 for TARGET in codepoint sentencepiece sinlib; do
   if [ "$TARGET" = sentencepiece ]; then SP_OPTION='--sp-vocab-size=512'; else SP_OPTION=''; fi
-  .venv/bin/python tools/train_slr52_ctc.py \
+  .venv/bin/python tools/train_ctc.py \
+    --dataset-id slr52 \
     --manifest data/manifests/slr52_training.csv \
     --encoder checkpoints/xls-r-300m-1a640f3 \
     --target "$TARGET" $SP_OPTION \

@@ -12,7 +12,7 @@ Primary intervention: transcript output-unit representation for CTC. Conditions 
 
 1. Confirm the corpus license, attribution, lineage, and permitted processing/release.
 2. Complete audio decode, duration and sample-rate audit; inspect references and duplicates.
-3. Freeze the approved speaker-grouped split, report its duration balance and exact transcript overlap, and retain repeated-prompt and text-novel masks. Rebalance only if the chosen evaluation scope requires it.
+3. Freeze the selected data manifest. Use a speaker-grouped split where speaker IDs exist, reporting duration balance and transcript overlap. For a source without speaker IDs, label its internal split as speaker-overlap unknown and reserve an independent speaker-identified evaluation set for unseen-speaker claims.
 4. Pin model and software revisions; establish the candidate encoder's license and known training-data overlap.
 5. Pin sinlib version and characterize segmentation, normalization, Unicode coverage, unknown handling, reversibility, special tokens, sequence lengths, and CTC alignment feasibility.
 6. Train a code-point pipeline smoke/overfit run and profile 5–8 GPU hours before fixing the final run count.
@@ -36,6 +36,8 @@ No failed gate is silently waived; its impact becomes an explicit limitation or 
 | Seeds | Target 3 predeclared seeds per arm; if cost gate fails, run 1 equal-budget seed per arm and 2 additional seeds for sinlib and the strongest conventional arm; third arm remains exploratory |
 
 If an arm cannot fit or align due to its output sequence length, record examples affected and failure rate. Do not filter difficult utterances for only one arm. If a shared utterance is impossible in one condition, predeclare a common evaluable subset and also report full-coverage results.
+
+The `IAmNotAnanth/sinhala-ctc-111h` source contains audio, text, and duration but no speaker IDs. Its prepared internal split groups exact audio duplicates and identical normalized transcripts; this prevents those exact forms of leakage but cannot certify speaker independence or independence from other OpenSLR-derived corpora. Treat internal dev scores as exploratory until a separate, lineage-checked external test is available.
 
 ## Normalization and metrics
 

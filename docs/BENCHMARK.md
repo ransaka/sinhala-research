@@ -1,4 +1,14 @@
-# SLR52 benchmark record
+# Data and benchmark record
+
+## Current audio/text/duration training source
+
+The default runner now uses [`IAmNotAnanth/sinhala-ctc-111h`](https://huggingface.co/datasets/IAmNotAnanth/sinhala-ctc-111h) at revision `a59ffd444b39ff3c9fca387f2d4879201511f93b`: one train split, 178,364 rows, 26 Parquet shards, with `audio`, `text`, and `duration`. The embedded audio is reported as mono 16 kHz and the card describes about 111 hours of cleaned OpenSLR-derived speech. No speaker ID, source utterance ID, or official dev/test split is published. The source paths such as `si_0000001.wav` do not map directly to the original OpenSLR FileIDs; transcript-only joining cannot recover speakers reliably.
+
+`tools/prepare_hf_audio_manifest.py` streams the pinned rows, verifies decoded audio headers, records duration discrepancies, materializes content-addressed audio privately, and creates a deterministic 80/10/10 exploratory train/dev/test allocation. Exact duplicate audio and identical NFC/whitespace-normalized transcripts stay in one partition; test paths and references go to a separate sealed CSV. **Speaker overlap remains unknown.** This split supports pipeline work and controlled target comparisons on the same audio, but cannot establish generalization to new voices. A speaker-identified independent test set is needed for that claim.
+
+The Hub card's license metadata says CC BY 4.0 while the [original OpenSLR 52 page](https://openslr.org/52/) lists Attribution-ShareAlike 4.0. Preserve both source records and resolve the applicable obligations before distributing derived audio or models.
+
+## Optional SLR52 source
 
 The intended corpus is OpenSLR SLR52, mirrored at `Ransaka/SinhalaASR` revision `bd1d968241e7edf8ce1577f569f59aac5c0f6b37`. The mirror metadata has 155,970 utterance IDs and 478 anonymized speakers; its original train/test split repeats speakers across partitions. The mirror card describes CC BY-SA 4.0. Retain the source citation, license text, archive and metadata hashes, attribution decision, and processing permission with the private experiment record.
 
