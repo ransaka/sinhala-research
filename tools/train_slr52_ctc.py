@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stream real SLR52 FLAC files into a resumable XLS-R code-point CTC run.
+"""Stream real SLR52 FLAC files into a resumable XLS-R CTC run.
 
 The prepared manifest must come from prepare_slr52_training_manifest.py. This
 script reads only train/dev rows. A train limit is for recipe/throughput pilots;
@@ -24,7 +24,11 @@ import torch
 from jiwer import cer, wer
 from transformers import Wav2Vec2FeatureExtractor, Wav2Vec2ForCTC
 
-from train_ctc_pilot import MODEL_REVISION, SAMPLE_RATE, build_vocab, decode, encode, normalize, padded_batch
+from ctc_common import SAMPLE_RATE, normalize, padded_batch
+from ctc_targets import build_targets, load_targets
+
+
+MODEL_REVISION = "1a640f32ac3e39899438a2931f9924c02f080a54"
 
 
 def file_hash(path: Path) -> str:
@@ -95,18 +99,18 @@ def batches(rows: list[dict], batch_size: int):
 
 
 @torch.no_grad()
-def evaluate(model, rows, feature_extractor, vocab, device, batch_size):
+def evaluate(model, rows, feature_extractor, targets, device, batch_size):
     model.eval()
     references, hypotheses, predictions = [], [], []
     blank_frames = frame_count = 0
     for batch in batches(rows, batch_size):
-        inputs, mask, _ = padded_batch(batch, feature_extractor, vocab, device)
+        inputs, mask, _ = padded_batch(batch, feature_extractor, targets, device)
         logits = model(input_values=inputs, attention_mask=mask).logits
         lengths = model._get_feat_extract_output_lengths(mask.sum(-1)).cpu().tolist()
         ids = logits.argmax(-1).cpu().tolist()
         for row, sequence, length in zip(batch, ids, lengths):
             valid = sequence[:length]
-            hypothesis = decode(valid, vocab)
+            hypothesis = targets.decode(valid)
             references.append(row["text"])
             hypotheses.append(hypothesis)
             predictions.append({"utterance_id": row["id"], "reference": row["text"],
@@ -153,6 +157,9 @@ def main() -> None:
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--encoder", type=Path, default=Path("checkpoints/xls-r-300m-1a640f3"))
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--target", choices=["codepoint", "sentencepiece", "sinlib"], default="codepoint")
+    parser.add_argument("--sp-vocab-size", type=int, default=512,
+                        help="SentencePiece unigram vocabulary size, including its unknown unit")
     parser.add_argument("--resume", type=Path, help="Path to this trainer's step-* checkpoint directory")
     parser.add_argument("--train-limit", type=int, default=0, help="0 uses every train row")
     parser.add_argument("--dev-limit", type=int, default=512, help="0 uses every dev row")
@@ -178,17 +185,31 @@ def main() -> None:
         raise ValueError("Limits must be nonnegative")
     if args.bucket_size < 0:
         raise ValueError("Bucket size must be nonnegative")
+    if args.sp_vocab_size < 32:
+        raise ValueError("SentencePiece vocabulary size must be at least 32")
 
     manifest_hash = file_hash(args.manifest)
     train_all, dev_all, counts = read_manifest(args.manifest)
     train = choose_rows(train_all, args.train_limit, args.seed)
     dev = choose_rows(dev_all, args.dev_limit, args.seed + 1)
     train_eval = choose_rows(train, args.train_eval_examples, args.seed + 2)
-    vocab = build_vocab(train)
-    vocab_text = json.dumps(vocab, ensure_ascii=False, sort_keys=True)
-    vocab_hash = hashlib.sha256(vocab_text.encode()).hexdigest()
+    if args.resume:
+        if not args.output.is_dir():
+            raise ValueError("Resume output directory does not exist")
+        targets, target_meta = load_targets(args.output)
+        if targets.kind != args.target:
+            raise ValueError("Resume target type differs from the saved run")
+    else:
+        if args.output.exists() and any(args.output.iterdir()):
+            raise ValueError(f"Output directory is not empty: {args.output}")
+        args.output.mkdir(parents=True, exist_ok=True)
+        (args.output / "checkpoints").mkdir(exist_ok=True)
+        targets, target_meta = build_targets(args.target, train, args.output, args.sp_vocab_size)
+    target_audit = {"train": targets.audit(train, "train", strict=True),
+                    "dev": targets.audit(dev, "dev")}
     signature = {
-        "manifest_sha256": manifest_hash, "vocab_sha256": vocab_hash,
+        "manifest_sha256": manifest_hash, "target_metadata": target_meta,
+        "target_type": args.target, "sp_vocab_size": args.sp_vocab_size,
         "train_limit": args.train_limit, "dev_limit": args.dev_limit,
         "train_eval_examples": args.train_eval_examples, "batch_size": args.batch_size,
         "bucket_size": args.bucket_size,
@@ -198,8 +219,6 @@ def main() -> None:
         "keep_checkpoints": args.keep_checkpoints, "log_every": args.log_every,
     }
     if args.resume:
-        if not args.output.is_dir():
-            raise ValueError("Resume output directory does not exist")
         old = json.loads((args.output / "run_config.json").read_text())
         if old["signature"] != signature:
             raise ValueError("Resume arguments or manifest/vocabulary differ from the saved run")
@@ -208,11 +227,6 @@ def main() -> None:
         latest = json.loads((args.output / "latest_checkpoint.json").read_text())
         if args.resume.resolve() != Path(latest["path"]).resolve():
             raise ValueError("Resume from the latest checkpoint to preserve metric and best-model history")
-    else:
-        if args.output.exists() and any(args.output.iterdir()):
-            raise ValueError(f"Output directory is not empty: {args.output}")
-        args.output.mkdir(parents=True, exist_ok=True)
-        (args.output / "checkpoints").mkdir(exist_ok=True)
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -224,7 +238,7 @@ def main() -> None:
                  "activation_dropout": 0.0, "layerdrop": 0.0} if args.regularization == "none" else {}
     source = args.resume / "model" if args.resume else args.encoder
     model = Wav2Vec2ForCTC.from_pretrained(
-        source, vocab_size=len(vocab), pad_token_id=0, ctc_loss_reduction="mean",
+        source, vocab_size=len(targets.vocab), pad_token_id=0, ctc_loss_reduction="mean",
         ctc_zero_infinity=True, ignore_mismatched_sizes=False if args.resume else True,
         **overrides,
     )
@@ -243,13 +257,14 @@ def main() -> None:
         "dataset": "SLR52 extracted FLAC with explicit speaker split",
         "signature": signature, "source_manifest": str(args.manifest.resolve()),
         "encoder": str(args.encoder.resolve()), "encoder_revision": MODEL_REVISION,
-        "target_units": "NFC Unicode code points; spaces mapped to |",
+        "target_units": args.target,
+        "target_audit": target_audit,
         "normalization": "NFC and whitespace collapse, no reference correction",
         "train_rows": len(train), "dev_rows_scored": len(dev),
         "train_eval_rows": len(train_eval), "manifest_partitions": counts,
         "train_hours_from_headers": sum(row["seconds"] for row in train) / 3600,
         "dev_hours_from_headers": sum(row["seconds"] for row in dev) / 3600,
-        "vocab_size": len(vocab), "device": str(device),
+        "vocab_size": len(targets.vocab), "device": str(device),
         "initial_max_steps": args.max_steps,
         "model_parameters": sum(p.numel() for p in model.parameters()),
         "test_partition_opened": False,
@@ -260,7 +275,6 @@ def main() -> None:
     }
     if not args.resume:
         write_json(args.output / "run_config.json", run_config)
-        write_json(args.output / "vocab.json", vocab)
         write_json(args.output / "selected_ids.json", {
             "train": [row["id"] for row in train], "dev": [row["id"] for row in dev],
             "train_eval": [row["id"] for row in train_eval],
@@ -294,8 +308,8 @@ def main() -> None:
     metrics_path = args.output / "metrics.jsonl"
 
     def run_evaluation() -> None:
-        train_metrics, train_predictions = evaluate(model, train_eval, extractor, vocab, device, args.batch_size)
-        dev_metrics, dev_predictions = evaluate(model, dev, extractor, vocab, device, args.batch_size)
+        train_metrics, train_predictions = evaluate(model, train_eval, extractor, targets, device, args.batch_size)
+        dev_metrics, dev_predictions = evaluate(model, dev, extractor, targets, device, args.batch_size)
         record = {"step": state["step"], "epoch": state["epoch"] + 1,
                   "train": train_metrics, "dev": dev_metrics,
                   "elapsed_seconds_this_process": time.perf_counter() - start,
@@ -325,11 +339,11 @@ def main() -> None:
         for batch_index in range(state["batch_offset"], (len(order) + args.batch_size - 1) // args.batch_size):
             indices = order[batch_index * args.batch_size : (batch_index + 1) * args.batch_size]
             batch = [load_audio(train[i]) for i in indices]
-            inputs, mask, labels = padded_batch(batch, extractor, vocab, device)
+            inputs, mask, labels = padded_batch(batch, extractor, targets, device)
             output_lengths = model._get_feat_extract_output_lengths(mask.sum(-1)).cpu().tolist()
             for row, available in zip(batch, output_lengths):
-                targets = encode(row["text"], vocab)
-                needed = len(targets) + sum(a == b for a, b in zip(targets, targets[1:]))
+                target_ids = targets.encode(row["text"])
+                needed = len(target_ids) + sum(a == b for a, b in zip(target_ids, target_ids[1:]))
                 if needed > available:
                     raise ValueError(f"CTC-infeasible utterance {row['id']}: needs {needed}, has {available}")
             model.train()

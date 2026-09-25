@@ -16,7 +16,6 @@ import io
 import json
 import random
 import time
-import unicodedata
 from pathlib import Path
 
 import numpy as np
@@ -27,14 +26,11 @@ import torch.nn.functional as F
 from jiwer import cer, wer
 from transformers import Wav2Vec2FeatureExtractor, Wav2Vec2ForCTC
 
+from ctc_common import SAMPLE_RATE, normalize, padded_batch
+
 
 DATASET_REVISION = "bd6c1be581c7831612730d3ae209caa3fe38bfa2"
 MODEL_REVISION = "1a640f32ac3e39899438a2931f9924c02f080a54"
-SAMPLE_RATE = 16_000
-
-
-def normalize(text: str) -> str:
-    return " ".join(unicodedata.normalize("NFC", text).split())
 
 
 def load_rows(parquet_path: Path) -> list[dict]:
@@ -93,26 +89,6 @@ def decode(ids: list[int], vocab: dict[str, int]) -> str:
             out.append(" " if token == "|" else ("�" if token == "<unk>" else token))
         previous = token_id
     return "".join(out)
-
-
-def padded_batch(rows: list[dict], feature_extractor, vocab, device):
-    features = feature_extractor(
-        [row["waveform"] for row in rows],
-        sampling_rate=SAMPLE_RATE,
-        padding=True,
-        return_attention_mask=True,
-        return_tensors="pt",
-    )
-    labels = [encode(row["text"], vocab) for row in rows]
-    max_len = max(map(len, labels))
-    label_tensor = torch.full((len(rows), max_len), -100, dtype=torch.long)
-    for i, ids in enumerate(labels):
-        label_tensor[i, : len(ids)] = torch.tensor(ids, dtype=torch.long)
-    return (
-        features.input_values.to(device),
-        features.attention_mask.to(device) if "attention_mask" in features else None,
-        label_tensor.to(device),
-    )
 
 
 @torch.no_grad()

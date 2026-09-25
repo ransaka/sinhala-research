@@ -25,8 +25,14 @@ venv/
 __pycache__/
 .DS_Store
 
-# Keep the repository focused on project code and phase status updates.
+# Keep only canonical research documentation and phase updates.
 *.md
+!README.md
+!AGENTS.md
+!EXPERIMENT_PROTOCOL_v1.md
+!docs/
+!docs/RUNNING_EXPERIMENTS.md
+!docs/BENCHMARK.md
 !phase/PHASE*_STATUS.md
 references/
 .codex/
