@@ -250,7 +250,9 @@ if [[ "$RESUME" == latest ]]; then
   RESUME="$(.venv/bin/python - "$OUTPUT/latest_checkpoint.json" <<'PY'
 import json, sys
 from pathlib import Path
-print(json.loads(Path(sys.argv[1]).read_text())['path'])
+pointer = Path(sys.argv[1])
+checkpoint = Path(json.loads(pointer.read_text())['path'])
+print((checkpoint if checkpoint.is_absolute() else pointer.parent / checkpoint).resolve())
 PY
 )"
 fi

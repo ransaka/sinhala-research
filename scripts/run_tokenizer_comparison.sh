@@ -49,11 +49,11 @@ done
 [[ "$SP_VOCAB_SIZE" =~ ^[1-9][0-9]*$ ]] || { echo "Invalid --sp-vocab-size" >&2; exit 2; }
 for TARGET in codepoint sentencepiece sinlib; do
   echo "Starting $TARGET run in $OUTPUT_ROOT/$TARGET" >&2
-  RESUME_ARGS=()
+  COMMAND=(bash "$ROOT_DIR/scripts/run_ctc.sh" "${FORWARD[@]}"
+    --target "$TARGET" --sp-vocab-size "$SP_VOCAB_SIZE"
+    --output "$OUTPUT_ROOT/$TARGET")
   if ((RESUME_ALL)) && [[ -f "$OUTPUT_ROOT/$TARGET/latest_checkpoint.json" ]]; then
-    RESUME_ARGS=(--resume latest)
+    COMMAND+=(--resume latest)
   fi
-  bash "$ROOT_DIR/scripts/run_ctc.sh" \
-    "${FORWARD[@]}" "${RESUME_ARGS[@]}" --target "$TARGET" --sp-vocab-size "$SP_VOCAB_SIZE" \
-    --output "$OUTPUT_ROOT/$TARGET"
+  "${COMMAND[@]}"
 done

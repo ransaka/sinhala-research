@@ -4,7 +4,7 @@ Run these commands from a clone of this repository. The default dataset is pinne
 
 ## Matched three-target run
 
-Use the wrapper to run all three arms sequentially at a shared data, seed, update, batch, and evaluation setting. Each target gets a separate output directory. SentencePiece unigram is trained from scratch using only the selected training transcripts; the sinlib package supplies a fixed segmenter, while its CTC unit inventory is built from those same transcripts. The code-point arm is the baseline. The mechanism under test is whether CTC output units change alignment and recognition errors.
+Use the wrapper to run all three arms sequentially at a shared data, seed, update, batch, and evaluation setting. Each target gets a separate output directory. SentencePiece unigram and sinlib are trained from scratch using only the selected training transcripts. Sinlib training builds a corpus-specific phonological-unit vocabulary; its segmentation rules still come from the pinned sinlib package. The code-point arm is the baseline. The mechanism under test is whether CTC output units change alignment and recognition errors.
 
 ```bash
 bash scripts/run_tokenizer_comparison.sh --dataset hf-audio \
@@ -12,7 +12,16 @@ bash scripts/run_tokenizer_comparison.sh --dataset hf-audio \
   --sp-vocab-size 512 --output-root outputs/iam111h-targets-stage
 ```
 
-All arms must use the same prepared manifest, audio exposure, and greedy decoding. Keep `--sp-vocab-size` fixed before comparing results. Resume all arms with the same command, a larger `--steps`, and `--resume latest`. For a complete-corpus run, pass `--train-limit 0 --dev-limit 0` and choose a new output root. `train_log.jsonl` records sampled current-batch loss every `--log-every` updates and at the final step. `metrics.jsonl` stores evaluation history; `run_events.jsonl` records starts, resumes, and completion. `target/metadata.json` records tokenizer version, vocabulary hash, and train-text hash. `target/spm.model` is the locally trained SentencePiece model.
+All arms must use the same prepared manifest, audio exposure, and greedy decoding. Keep `--sp-vocab-size` fixed before comparing results. Resume all arms with the same command, a larger `--steps`, and `--resume latest`. For a complete-corpus run, pass `--train-limit 0 --dev-limit 0` and choose a new output root. `train_log.jsonl` records sampled current-batch loss every `--log-every` updates and at the final step. `metrics.jsonl` stores evaluation history; `run_events.jsonl` records starts, resumes, and completion. `target/metadata.json` records tokenizer version, vocabulary hash, and train-text hash. `target/spm.model` is the locally trained SentencePiece model; `target/sinlib/` stores sinlib's trained vocabulary and config. Each new `checkpoints/step-*/` directory also contains `model/`, `target/`, and `feature_extractor/`, so the selected checkpoint has all inference assets together. `trainer_state.pt` adds optimizer and RNG state for resuming training.
+
+Verify a saved checkpoint by loading its model, audio feature extractor, and text tokenizer directly from the checkpoint directory:
+
+```bash
+.venv/bin/python tools/verify_ctc_checkpoint.py \
+  outputs/iam111h-targets-stage/sinlib/checkpoints/step-00002048
+```
+
+The same command works for code-point and SentencePiece checkpoints. Checkpoints made before this packaging change have tokenizer assets only in their parent run's `target/` directory; keep the full run directory for those older checkpoints.
 
 Compare normalized dev WER at a predeclared fixed update count; CER and error slices are secondary. Report parameter counts, processed audio seconds, target coverage and round-trip diagnostics, and CTC-infeasible rows alongside scores. Failure conditions include train round-trip or unknown-unit errors, substantial dev unknowns, CTC-infeasible rows, or failure to learn under the common budget. A benchmark claim requires a frozen speaker-disjoint test set and multiple seeds. The current trainer stores NFC plus whitespace-collapsed references and scores that same profile (`nfc_ws_v1`); its prediction files do not contain corpus-raw references or the proposed punctuation/Latin casefold profile. Freeze this scoring profile for this comparison, or implement and predeclare a different one before any final test.
 
@@ -179,9 +188,9 @@ Run one command at a time. Each selects the same deterministic 2,048 train utter
   --checkpoint-every 1024 --keep-checkpoints 2 --regularization none --seed 13
 ```
 
-`none` disables SpecAugment, dropout, and layerdrop while retaining AdamW weight decay 0.01, matching the successful small-data pilot. The target vocabulary and SentencePiece model use selected **training references only**. `sinlib` 0.3.2 supplies segmentation; sorted train-only units receive deterministic CTC IDs. Train round-trip and unknown-unit checks must pass before optimization; dev unknowns and reconstruction mismatches are saved in `run_config.json`.
+`none` disables SpecAugment, dropout, and layerdrop while retaining AdamW weight decay 0.01, matching the successful small-data pilot. All target vocabularies use selected **training references only**. `sinlib` 0.3.2 trains its vocabulary on those references; sorted train-only units receive deterministic CTC IDs. Training a sinlib vocabulary cannot guarantee coverage of unseen development units, because its segmentation rules still emit new unit combinations. Train round-trip and unknown-unit checks must pass before optimization; dev unknowns and reconstruction mismatches are saved in `run_config.json`.
 
-Inspect `metrics.jsonl` for train/dev WER, CER, empty hypotheses, blank-argmax fraction, and processed audio seconds. `eval_predictions/` has reference/hypothesis rows; `best_dev_model/` stores the best dev-CER weights. `target/` has the vocabulary, metadata and, for SentencePiece, `spm.model`. `checkpoints/` stores optimizer and RNG state. These subset scores are exploratory.
+Inspect `metrics.jsonl` for train/dev WER, CER, empty hypotheses, blank-argmax fraction, and processed audio seconds. `eval_predictions/` has reference/hypothesis rows; `best_dev_model/` stores the best dev-CER weights and inference assets when requested. `target/` has the CTC vocabulary, metadata, and trained text tokenizer assets. `checkpoints/` stores model, target, feature extractor, optimizer, and RNG state. These subset scores are exploratory.
 
 ## 4. Resume a stopped run
 

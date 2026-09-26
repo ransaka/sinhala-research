@@ -166,7 +166,15 @@ def append_jsonl(path: Path, value) -> None:
         stream.write(json.dumps(value, ensure_ascii=False) + "\n")
 
 
-def save_checkpoint(model, optimizer, output: Path, step: int, state: dict, keep: int,
+def save_inference_artifacts(model, feature_extractor, output: Path, destination: Path,
+                             *, model_subdir: bool = True) -> None:
+    """Store the model and all text/audio preprocessing beside its weights."""
+    model.save_pretrained(destination / "model" if model_subdir else destination)
+    feature_extractor.save_pretrained(destination / "feature_extractor")
+    shutil.copytree(output / "target", destination / "target", dirs_exist_ok=True)
+
+
+def save_checkpoint(model, feature_extractor, optimizer, output: Path, step: int, state: dict, keep: int,
                     rank: int, world_size: int, device: torch.device) -> None:
     rank_rng = {
         "python_rng": random.getstate(),
@@ -188,7 +196,7 @@ def save_checkpoint(model, optimizer, output: Path, step: int, state: dict, keep
     if temporary.exists():
         shutil.rmtree(temporary)
     temporary.mkdir(parents=True)
-    model.save_pretrained(temporary / "model")
+    save_inference_artifacts(model, feature_extractor, output, temporary)
     torch.save({
         "optimizer": optimizer.state_dict(),
         "state": state,
@@ -197,7 +205,8 @@ def save_checkpoint(model, optimizer, output: Path, step: int, state: dict, keep
     if folder.exists():
         shutil.rmtree(folder)
     temporary.rename(folder)
-    write_json(output / "latest_checkpoint.json", {"path": str(folder.resolve()), "step": step})
+    # A relative pointer keeps the run reloadable after moving its output directory.
+    write_json(output / "latest_checkpoint.json", {"path": str(folder.relative_to(output)), "step": step})
     old = sorted((output / "checkpoints").glob("step-*"))
     for path in old[:-keep]:
         shutil.rmtree(path)
@@ -304,7 +313,10 @@ def main() -> None:
         if args.resume.parent.resolve() != (args.output / "checkpoints").resolve():
             raise ValueError("Resume checkpoint must belong to the specified output directory")
         latest = json.loads((args.output / "latest_checkpoint.json").read_text())
-        if args.resume.resolve() != Path(latest["path"]).resolve():
+        latest_path = Path(latest["path"])
+        if not latest_path.is_absolute():
+            latest_path = args.output / latest_path
+        if args.resume.resolve() != latest_path.resolve():
             raise ValueError("Resume from the latest checkpoint to preserve metric and best-model history")
 
     random.seed(args.seed + rank)
@@ -420,7 +432,9 @@ def main() -> None:
             if dev_metrics["cer"] < state["best_dev_cer"]:
                 state["best_dev_cer"] = dev_metrics["cer"]
                 if not args.no_best_model:
-                    raw_model.save_pretrained(args.output / "best_dev_model")
+                    best = args.output / "best_dev_model"
+                    best.mkdir(exist_ok=True)
+                    save_inference_artifacts(raw_model, extractor, args.output, best, model_subdir=False)
                 write_json(args.output / "best_dev_metrics.json", record)
             print(json.dumps(record, ensure_ascii=False), flush=True)
         if world_size > 1:
@@ -479,7 +493,7 @@ def main() -> None:
             if state["step"] % args.eval_every == 0 or state["step"] == args.max_steps:
                 run_evaluation()
             if state["step"] % args.checkpoint_every == 0 or state["step"] == args.max_steps:
-                save_checkpoint(raw_model, optimizer, args.output, state["step"], state,
+                save_checkpoint(raw_model, extractor, optimizer, args.output, state["step"], state,
                                 args.keep_checkpoints, rank, world_size, device)
             if state["step"] >= args.max_steps:
                 break

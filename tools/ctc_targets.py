@@ -107,7 +107,19 @@ def build_targets(kind: str, train: list[dict], output: Path, sp_vocab_size: int
         processor = None
     elif kind == "sinlib":
         processor = Tokenizer()
-        units = sorted({unit for text in texts for unit in processor.tokenize(text)})
+        processor.train(texts)
+        # sinlib 0.3.2 assigns learned IDs by iterating a set. Canonicalize
+        # those IDs so identical training text yields identical saved files.
+        special_tokens = processor.all_special_tokens
+        units = sorted(set(processor.vocab_map) - set(special_tokens))
+        processor.vocab_map = {
+            token: index for index, token in enumerate([*special_tokens, *units])
+        }
+        processor.token_id_to_token_map = {
+            index: token for token, index in processor.vocab_map.items()
+        }
+        sinlib_dir = target_dir / "sinlib"
+        processor.save_pretrained(str(sinlib_dir))
     elif kind == "sentencepiece":
         corpus = target_dir / "train_text.txt"
         corpus.write_text("\n".join(texts) + "\n", encoding="utf-8")
@@ -150,9 +162,18 @@ def build_targets(kind: str, train: list[dict], output: Path, sp_vocab_size: int
         }
     if kind == "sinlib":
         meta["sinlib_version"] = importlib.metadata.version("sinlib")
-        meta["sinlib_segmentation"] = "Tokenizer().tokenize; train-only sorted unit inventory"
+        meta["sinlib_training"] = "Tokenizer.train(selected_training_transcripts); sorted learned IDs after training"
+        meta["sinlib_segmentation"] = "Tokenizer.tokenize; segmentation is fixed by sinlib 0.3.2"
         meta["sinlib_special_tokens_excluded"] = processor.all_special_tokens
+        meta["sinlib_vocab_sha256"] = _digest(target_dir / "sinlib" / "vocab.json")
+        meta["sinlib_config_sha256"] = _digest(target_dir / "sinlib" / "config.json")
     (target_dir / "metadata.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+    if kind == "sinlib":
+        # Exercise the saved artifact, rather than trusting the in-memory fit.
+        result, meta = load_targets(output)
+        for text in texts:
+            if result.decode_units(result.encode(text)) != text:
+                raise ValueError("Saved sinlib tokenizer cannot round-trip training text")
     return result, meta
 
 
@@ -173,7 +194,21 @@ def load_targets(output: Path) -> tuple[CTCTargets, dict]:
             raise ValueError("Saved SentencePiece model changed")
         processor = spm.SentencePieceProcessor(model_file=str(model_path))
     elif kind == "sinlib":
-        processor = Tokenizer()
+        if "sinlib_vocab_sha256" in meta:
+            sinlib_dir = target_dir / "sinlib"
+            for filename, key in (("vocab.json", "sinlib_vocab_sha256"),
+                                  ("config.json", "sinlib_config_sha256")):
+                if _digest(sinlib_dir / filename) != meta[key]:
+                    raise ValueError(f"Saved sinlib tokenizer {filename} changed")
+            processor = Tokenizer.from_pretrained(str(sinlib_dir))
+            expected_units = set(processor.vocab_map) - set(processor.all_special_tokens)
+            saved_vocab = json.loads(vocab_path.read_text(encoding="utf-8"))
+            if expected_units != set(saved_vocab) - {"<blank>", "<unk>"}:
+                raise ValueError("Saved sinlib tokenizer and CTC vocabulary differ")
+        else:
+            # Runs made before corpus-trained sinlib artifacts used only the
+            # fixed segmenter and a saved CTC vocabulary.
+            processor = Tokenizer()
     elif kind == "codepoint":
         processor = None
     else:
