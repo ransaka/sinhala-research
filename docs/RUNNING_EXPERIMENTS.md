@@ -2,6 +2,47 @@
 
 Run these commands from a clone of this repository. The default dataset is pinned `IAmNotAnanth/sinhala-ctc-111h`; SLR52 and a prepared common CSV manifest remain available. One trainer handles code points, SentencePiece unigram, and `sinlib` phonological units. The only arm-specific training argument is `--target` (plus `--sp-vocab-size` for SentencePiece).
 
+## Matched three-target run
+
+Use the wrapper to run all three arms sequentially at a shared data, seed, update, batch, and evaluation setting. Each target gets a separate output directory. SentencePiece unigram is trained from scratch using only the selected training transcripts; the sinlib package supplies a fixed segmenter, while its CTC unit inventory is built from those same transcripts. The code-point arm is the baseline. The mechanism under test is whether CTC output units change alignment and recognition errors.
+
+```bash
+bash scripts/run_tokenizer_comparison.sh --dataset hf-audio \
+  --gpus 2 --steps 2048 --train-limit 2048 --dev-limit 512 \
+  --sp-vocab-size 512 --output-root outputs/iam111h-targets-stage
+```
+
+All arms must use the same prepared manifest, audio exposure, and greedy decoding. Keep `--sp-vocab-size` fixed before comparing results. Resume all arms with the same command, a larger `--steps`, and `--resume latest`. For a complete-corpus run, pass `--train-limit 0 --dev-limit 0` and choose a new output root. `train_log.jsonl` records sampled current-batch loss every `--log-every` updates and at the final step. `metrics.jsonl` stores evaluation history; `run_events.jsonl` records starts, resumes, and completion. `target/metadata.json` records tokenizer version, vocabulary hash, and train-text hash. `target/spm.model` is the locally trained SentencePiece model.
+
+Compare normalized dev WER at a predeclared fixed update count; CER and error slices are secondary. Report parameter counts, processed audio seconds, target coverage and round-trip diagnostics, and CTC-infeasible rows alongside scores. Failure conditions include train round-trip or unknown-unit errors, substantial dev unknowns, CTC-infeasible rows, or failure to learn under the common budget. A benchmark claim requires a frozen speaker-disjoint test set and multiple seeds. The current trainer stores NFC plus whitespace-collapsed references and scores that same profile (`nfc_ws_v1`); its prediction files do not contain corpus-raw references or the proposed punctuation/Latin casefold profile. Freeze this scoring profile for this comparison, or implement and predeclare a different one before any final test.
+
+After matched runs, compare a fixed evaluation step with:
+
+```bash
+.venv/bin/python tools/compare_ctc_predictions.py \
+  outputs/iam111h-targets-stage/codepoint/eval_predictions/step-00002048.jsonl \
+  outputs/iam111h-targets-stage/sentencepiece/eval_predictions/step-00002048.jsonl \
+  --partition dev --output outputs/iam111h-targets-stage/codepoint-vs-sp.json
+.venv/bin/python tools/compare_ctc_predictions.py \
+  outputs/iam111h-targets-stage/codepoint/eval_predictions/step-00002048.jsonl \
+  outputs/iam111h-targets-stage/sinlib/eval_predictions/step-00002048.jsonl \
+  --partition dev --output outputs/iam111h-targets-stage/codepoint-vs-sinlib.json
+```
+
+The scorer checks matched utterance IDs and references and reports paired uncertainty. Check each run's manifest and selected-ID hashes in `run_config.json` as well; prediction matching alone cannot establish identical audio.
+
+For the already downloaded 1,000-row ASR1K sample, prepare a private manifest with transcript-grouped train/dev/test partitions, then run a short workflow check:
+
+```bash
+.venv/bin/python tools/prepare_asr1k_manifest.py
+bash scripts/run_tokenizer_comparison.sh --dataset manifest \
+  --manifest data/manifests/asr1k_exploratory.csv \
+  --steps 2 --train-limit 32 --dev-limit 8 --batch-size 1 \
+  --eval-every 2 --checkpoint-every 2 --output-root outputs/asr1k-targets-smoke
+```
+
+Two updates check training, logging, and checkpointing; they do not support a recognition comparison. The ASR1K manifest records no test transcript or audio path, and its partitioning groups identical normalized transcripts. Speaker overlap remains unknown.
+
 ## Default: 111-hour dataset on two GPUs
 
 Install `uv` and `hf` if absent, accept the dataset's access conditions on its [Hub page](https://huggingface.co/datasets/IAmNotAnanth/sinhala-ctc-111h), then authenticate with `hf auth login` if the Hub requests it. From the repo root:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import importlib.metadata
 import json
+import math
 from pathlib import Path
 
 import sentencepiece as spm
@@ -13,6 +14,13 @@ from sinlib import Tokenizer
 
 def _digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _percentile(values: list[int], fraction: float) -> int | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    return ordered[math.ceil(fraction * len(ordered)) - 1]
 
 
 class CTCTargets:
@@ -53,18 +61,28 @@ class CTCTargets:
 
     def audit(self, rows: list[dict], name: str, *, strict: bool = False) -> dict:
         unknowns = 0
+        unknown_rows = 0
         mismatches = []
         lengths = []
         for row in rows:
             ids = self.encode(row["text"])
-            unknowns += ids.count(1)
+            row_unknowns = ids.count(1)
+            unknowns += row_unknowns
+            unknown_rows += bool(row_unknowns)
             lengths.append(len(ids))
             if self.decode_units(ids) != row["text"]:
                 mismatches.append(row["id"])
         result = {"rows": len(rows), "unknown_units": unknowns,
+                  "unknown_rows": unknown_rows,
+                  "unknown_unit_rate": unknowns / sum(lengths) if sum(lengths) else 0.0,
                   "roundtrip_mismatches": len(mismatches),
                   "example_mismatch_ids": mismatches[:10],
-                  "target_length_min": min(lengths), "target_length_max": max(lengths)}
+                  "target_length_min": min(lengths, default=None),
+                  "target_length_p50": _percentile(lengths, 0.50),
+                  "target_length_p90": _percentile(lengths, 0.90),
+                  "target_length_p99": _percentile(lengths, 0.99),
+                  "target_length_max": max(lengths, default=None),
+                  "target_length_mean": sum(lengths) / len(lengths) if lengths else None}
         if strict and (unknowns or mismatches):
             raise ValueError(f"{name} target audit failed: {result}")
         return result
@@ -112,12 +130,28 @@ def build_targets(kind: str, train: list[dict], output: Path, sp_vocab_size: int
         vocab[unit] = len(vocab)
     (target_dir / "vocab.json").write_text(json.dumps(vocab, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     result = CTCTargets(kind, vocab, processor)
-    meta = {"type": kind, "vocab_size": len(vocab), "vocab_sha256": _digest(target_dir / "vocab.json")}
+    meta = {"type": kind, "vocab_size": len(vocab),
+            "vocab_sha256": _digest(target_dir / "vocab.json"),
+            "inventory_source": "selected_training_transcripts_only",
+            "training_transcript_count": len(texts),
+            "training_text_sha256": hashlib.sha256(
+                json.dumps(texts, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()}
     if kind == "sentencepiece":
         meta["spm_model_sha256"] = _digest(target_dir / "spm.model")
         meta["sentencepiece_version"] = importlib.metadata.version("sentencepiece")
+        meta["sentencepiece_config"] = {
+            "model_type": "unigram", "requested_vocab_size": sp_vocab_size,
+            "actual_vocab_size": processor.vocab_size(),
+            "character_coverage": 1.0, "normalization_rule_name": "identity",
+            "add_dummy_prefix": False, "remove_extra_whitespaces": False,
+            "bos_id": -1, "eos_id": -1, "pad_id": -1, "unk_id": 0,
+            "hard_vocab_limit": False, "num_threads": 1,
+        }
     if kind == "sinlib":
         meta["sinlib_version"] = importlib.metadata.version("sinlib")
+        meta["sinlib_segmentation"] = "Tokenizer().tokenize; train-only sorted unit inventory"
+        meta["sinlib_special_tokens_excluded"] = processor.all_special_tokens
     (target_dir / "metadata.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
     return result, meta
 

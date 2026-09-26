@@ -161,6 +161,11 @@ def write_json(path: Path, value) -> None:
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def append_jsonl(path: Path, value) -> None:
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(value, ensure_ascii=False) + "\n")
+
+
 def save_checkpoint(model, optimizer, output: Path, step: int, state: dict, keep: int,
                     rank: int, world_size: int, device: torch.device) -> None:
     rank_rng = {
@@ -379,18 +384,20 @@ def main() -> None:
             torch.mps.set_rng_state(rng["mps_rng"])
         if args.max_steps <= state["step"]:
             raise ValueError("--max-steps must exceed the checkpoint's completed step")
-        metrics_file = args.output / "metrics.jsonl"
-        if metrics_file.exists():
-            lines = metrics_file.read_text(encoding="utf-8").splitlines()
-            if lines and json.loads(lines[-1])["step"] > state["step"]:
-                raise ValueError("Metrics extend past the latest checkpoint; use a new output directory")
+        for log_name in ("metrics.jsonl", "train_log.jsonl"):
+            log_file = args.output / log_name
+            if log_file.exists():
+                lines = log_file.read_text(encoding="utf-8").splitlines()
+                if lines and json.loads(lines[-1])["step"] > state["step"]:
+                    raise ValueError(f"{log_name} extends past the latest checkpoint; use a new output directory")
 
     if rank == 0:
-        with (args.output / "run_events.jsonl").open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps({"event": "resume" if args.resume else "start",
-                                     "checkpoint": str(args.resume) if args.resume else None,
-                                     "target_max_steps": args.max_steps,
-                                     "unix_time": time.time()}, ensure_ascii=False) + "\n")
+        append_jsonl(args.output / "run_events.jsonl", {
+            "event": "resume" if args.resume else "start",
+            "checkpoint": str(args.resume) if args.resume else None,
+            "target_max_steps": args.max_steps,
+            "unix_time": time.time(),
+        })
 
     start = time.perf_counter()
     metrics_path = args.output / "metrics.jsonl"
@@ -403,8 +410,7 @@ def main() -> None:
                       "train": train_metrics, "dev": dev_metrics,
                       "elapsed_seconds_this_process": time.perf_counter() - start,
                       "processed_audio_seconds_total": state["processed_audio_seconds"]}
-            with metrics_path.open("a", encoding="utf-8") as stream:
-                stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+            append_jsonl(metrics_path, record)
             prediction_path = args.output / "eval_predictions" / f"step-{state['step']:08d}.jsonl"
             prediction_path.parent.mkdir(exist_ok=True)
             with prediction_path.open("w", encoding="utf-8") as stream:
@@ -456,16 +462,20 @@ def main() -> None:
             state["step"] += 1
             state["batch_offset"] = batch_index + 1
             state["processed_audio_seconds"] += sum(train[i]["seconds"] for i in global_indices)
-            if state["step"] % args.log_every == 0:
+            if state["step"] % args.log_every == 0 or state["step"] == args.max_steps:
                 log_loss = loss.detach().clone()
                 if world_size > 1:
                     dist.all_reduce(log_loss, op=dist.ReduceOp.SUM)
                     log_loss /= world_size
                 if rank == 0:
-                    print(json.dumps({"step": state["step"], "epoch": state["epoch"] + 1,
-                                      "loss": float(log_loss.cpu()),
-                                      "elapsed_seconds_this_process": time.perf_counter() - start},
-                                     ensure_ascii=False), flush=True)
+                    log_record = {
+                        "step": state["step"], "epoch": state["epoch"] + 1,
+                        "loss": float(log_loss.cpu()),
+                        "elapsed_seconds_this_process": time.perf_counter() - start,
+                        "processed_audio_seconds_total": state["processed_audio_seconds"],
+                    }
+                    append_jsonl(args.output / "train_log.jsonl", log_record)
+                    print(json.dumps(log_record, ensure_ascii=False), flush=True)
             if state["step"] % args.eval_every == 0 or state["step"] == args.max_steps:
                 run_evaluation()
             if state["step"] % args.checkpoint_every == 0 or state["step"] == args.max_steps:
@@ -477,10 +487,14 @@ def main() -> None:
             state["epoch"] += 1
             state["batch_offset"] = 0
     if rank == 0:
-        print(json.dumps({"completed": True, "step": state["step"],
-                          "best_dev_cer": state["best_dev_cer"],
-                          "wall_seconds_this_process": time.perf_counter() - start},
-                         ensure_ascii=False), flush=True)
+        completed = {"completed": True, "step": state["step"],
+                     "best_dev_cer": state["best_dev_cer"],
+                     "wall_seconds_this_process": time.perf_counter() - start}
+        append_jsonl(args.output / "run_events.jsonl", {
+            "event": "complete", "step": state["step"],
+            "best_dev_cer": state["best_dev_cer"], "unix_time": time.time(),
+        })
+        print(json.dumps(completed, ensure_ascii=False), flush=True)
     if world_size > 1:
         dist.destroy_process_group()
 

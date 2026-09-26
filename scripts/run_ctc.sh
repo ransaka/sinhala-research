@@ -23,6 +23,7 @@ TRAIN_LIMIT=2048
 DEV_LIMIT=512
 BATCH_SIZE=2
 EVAL_EVERY=512
+LOG_EVERY=100
 CHECKPOINT_EVERY=1024
 KEEP_CHECKPOINTS=1
 SAVE_BEST_MODEL=0
@@ -55,6 +56,7 @@ Options:
   --dev-limit N             0 means all dev rows (default 512)
   --batch-size N            Per-GPU batch size (default 2)
   --eval-every N            Update interval (default 512)
+  --log-every N             Training loss log interval (default 100)
   --checkpoint-every N      Update interval (default 1024)
   --keep-checkpoints N      Rolling checkpoints to retain (default 1)
   --save-best-model         Also retain dev-best model weights
@@ -72,7 +74,7 @@ EOF
 
 while (($#)); do
   case "$1" in
-    --dataset|--hf-repo|--hf-revision|--bucket-root|--manifest|--split|--target|--sp-vocab-size|--gpus|--steps|--train-limit|--dev-limit|--batch-size|--eval-every|--checkpoint-every|--keep-checkpoints|--seed|--data-dir|--audio-root|--encoder-dir|--output|--resume)
+    --dataset|--hf-repo|--hf-revision|--bucket-root|--manifest|--split|--target|--sp-vocab-size|--gpus|--steps|--train-limit|--dev-limit|--batch-size|--eval-every|--log-every|--checkpoint-every|--keep-checkpoints|--seed|--data-dir|--audio-root|--encoder-dir|--output|--resume)
       (($# >= 2)) || { echo "Missing value for $1" >&2; exit 2; }
       case "$1" in
         --dataset) DATASET="$2";;
@@ -89,6 +91,7 @@ while (($#)); do
         --dev-limit) DEV_LIMIT="$2";;
         --batch-size) BATCH_SIZE="$2";;
         --eval-every) EVAL_EVERY="$2";;
+        --log-every) LOG_EVERY="$2";;
         --checkpoint-every) CHECKPOINT_EVERY="$2";;
         --keep-checkpoints) KEEP_CHECKPOINTS="$2";;
         --seed) SEED="$2";;
@@ -110,7 +113,7 @@ done
 [[ "$DATASET" == hf-audio || "$DATASET" == slr52 || "$DATASET" == manifest ]] || { echo "Invalid dataset" >&2; exit 2; }
 [[ "$TARGET" == codepoint || "$TARGET" == sentencepiece || "$TARGET" == sinlib ]] || { echo "Invalid target" >&2; exit 2; }
 [[ "$GPUS" =~ ^[1-9][0-9]*$ ]] || { echo "--gpus must be a positive integer" >&2; exit 2; }
-for value in "$STEPS" "$BATCH_SIZE" "$EVAL_EVERY" "$CHECKPOINT_EVERY" "$SP_VOCAB_SIZE" "$KEEP_CHECKPOINTS"; do
+for value in "$STEPS" "$BATCH_SIZE" "$EVAL_EVERY" "$LOG_EVERY" "$CHECKPOINT_EVERY" "$SP_VOCAB_SIZE" "$KEEP_CHECKPOINTS"; do
   [[ "$value" =~ ^[1-9][0-9]*$ ]] || { echo "Steps, batch size and intervals must be positive integers" >&2; exit 2; }
 done
 for value in "$TRAIN_LIMIT" "$DEV_LIMIT" "$SEED"; do
@@ -257,6 +260,7 @@ TRAIN_ARGS=(--manifest "$MANIFEST" --dataset-id "$DATASET_ID"
   --sp-vocab-size "$SP_VOCAB_SIZE"
   --output "$OUTPUT" --train-limit "$TRAIN_LIMIT" --dev-limit "$DEV_LIMIT"
   --batch-size "$BATCH_SIZE" --max-steps "$STEPS" --eval-every "$EVAL_EVERY"
+  --log-every "$LOG_EVERY"
   --checkpoint-every "$CHECKPOINT_EVERY" --keep-checkpoints "$KEEP_CHECKPOINTS"
   --regularization none --seed "$SEED")
 if [[ "$SAVE_BEST_MODEL" -eq 0 ]]; then TRAIN_ARGS+=(--no-best-model); fi
